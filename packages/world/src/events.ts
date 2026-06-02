@@ -391,6 +391,12 @@ export interface CreateEventParams {
   resolveData?: ResolveData;
   /** Request ID (x-vercel-id when on Vercel) for correlating request logs with workflow events. */
   requestId?: string;
+  /**
+   * Optional caller-provided key that makes event creation idempotent.
+   * Worlds that support this should return the original event result when the
+   * same key is used again instead of appending a duplicate event.
+   */
+  idempotencyKey?: string;
 }
 
 /**
