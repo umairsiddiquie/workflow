@@ -830,6 +830,31 @@ describe('Storage', () => {
         expect(event.eventType).toBe('run_completed');
         expect(event.correlationId).toBeUndefined();
       });
+
+      it('should return the original event for duplicate idempotency keys', async () => {
+        const first = await storage.events.create(
+          testRunId,
+          {
+            eventType: 'run_started' as const,
+          },
+          { idempotencyKey: 'client.key/with/slashes' }
+        );
+        const second = await storage.events.create(
+          testRunId,
+          {
+            eventType: 'run_started' as const,
+          },
+          { idempotencyKey: 'client.key/with/slashes' }
+        );
+
+        expect(second.event?.eventId).toBe(first.event?.eventId);
+        expect(second.run?.runId).toBe(testRunId);
+
+        const events = await storage.events.list({ runId: testRunId });
+        expect(
+          events.data.filter((event) => event.eventType === 'run_started')
+        ).toHaveLength(1);
+      });
     });
 
     describe('list', () => {

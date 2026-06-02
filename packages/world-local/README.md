@@ -6,3 +6,4 @@ Stores workflow data as JSON files on disk and provides in-memory queuing. Autom
 
 Used by default on `next dev` and `next start`.
 
+Event writes support idempotency keys, allowing retried local event creation calls to return the original event without appending duplicates.

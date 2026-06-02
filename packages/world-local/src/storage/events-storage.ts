@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
@@ -68,6 +69,46 @@ const stepLocks = new Map<string, Promise<unknown>>();
 const HookTokenClaimSchema = z.object({
   runId: z.string(),
 });
+
+const EventIdempotencyClaimSchema = z.object({
+  runId: z.string(),
+  eventId: z.string(),
+});
+
+type EventIdempotencyClaim = z.infer<typeof EventIdempotencyClaimSchema>;
+
+async function readEventIdempotencyClaim(
+  claimPath: string
+): Promise<EventIdempotencyClaim | null> {
+  try {
+    return await readJSON(claimPath, EventIdempotencyClaimSchema);
+  } catch (error) {
+    if (error instanceof SyntaxError || error instanceof z.ZodError) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function eventIdempotencyLockName(key: string, tag: string | undefined) {
+  const hashedKey = `idmp_${createHash('sha256').update(key).digest('hex')}`;
+  return tag ? `${hashedKey}.${tag}` : hashedKey;
+}
+
+async function waitForEventIdempotencyClaim(
+  claimPath: string
+): Promise<EventIdempotencyClaim> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const claim = await readEventIdempotencyClaim(claimPath);
+    if (claim) {
+      return claim;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new WorkflowWorldError(
+    'Timed out waiting for idempotent event creation to finish'
+  );
+}
 
 async function readHookTokenClaim(
   constraintPath: string
@@ -160,6 +201,79 @@ async function writeRunUnderLifecycleLock<T extends WorkflowRun>(
   });
 }
 
+async function getIdempotentEventResult(
+  basedir: string,
+  tag: string | undefined,
+  claim: EventIdempotencyClaim,
+  resolveData: import('@workflow/world').ResolveData
+): Promise<EventResult> {
+  const event = await readJSON(
+    taggedPath(basedir, 'events', `${claim.runId}-${claim.eventId}`, tag),
+    EventSchema
+  );
+  if (!event) {
+    throw new WorkflowWorldError(
+      `Idempotency claim points at missing event ${claim.eventId}`
+    );
+  }
+
+  const result: EventResult = {
+    event: stripEventDataRefs(event, resolveData),
+  };
+
+  if (event.eventType.startsWith('run_')) {
+    result.run =
+      (await readJSONWithFallback(
+        basedir,
+        'runs',
+        claim.runId,
+        WorkflowRunSchema,
+        tag
+      )) ?? undefined;
+  } else if (
+    event.eventType === 'step_created' ||
+    event.eventType === 'step_started' ||
+    event.eventType === 'step_completed' ||
+    event.eventType === 'step_failed' ||
+    event.eventType === 'step_retrying'
+  ) {
+    result.step = event.correlationId
+      ? ((await readJSONWithFallback(
+          basedir,
+          'steps',
+          `${claim.runId}-${event.correlationId}`,
+          StepSchema,
+          tag
+        )) ?? undefined)
+      : undefined;
+  } else if (event.eventType === 'hook_created') {
+    result.hook = event.correlationId
+      ? ((await readJSONWithFallback(
+          basedir,
+          'hooks',
+          event.correlationId,
+          HookSchema,
+          tag
+        )) ?? undefined)
+      : undefined;
+  } else if (
+    event.eventType === 'wait_created' ||
+    event.eventType === 'wait_completed'
+  ) {
+    result.wait = event.correlationId
+      ? ((await readJSONWithFallback(
+          basedir,
+          'waits',
+          `${claim.runId}-${event.correlationId}`,
+          WaitSchema,
+          tag
+        )) ?? undefined)
+      : undefined;
+  }
+
+  return result;
+}
+
 /**
  * Creates the events storage implementation using the filesystem.
  * Implements the Storage['events'] interface with create, list, and listByCorrelationId operations.
@@ -187,6 +301,28 @@ export function createEventsStorage(
       if ('correlationId' in data && typeof data.correlationId === 'string') {
         assertSafeEntityId('correlationId', data.correlationId);
       }
+      let idempotencyClaimPath: string | undefined;
+      let idempotencyClaimed = false;
+      if (params?.idempotencyKey) {
+        const lockName = eventIdempotencyLockName(params.idempotencyKey, tag);
+        idempotencyClaimPath = resolveWithinBase(
+          basedir,
+          '.locks',
+          'events',
+          `${lockName}.json`
+        );
+        idempotencyClaimed = await writeExclusive(idempotencyClaimPath, '');
+        if (!idempotencyClaimed) {
+          const resolveData =
+            params?.resolveData ?? DEFAULT_RESOLVE_DATA_OPTION;
+          return getIdempotentEventResult(
+            basedir,
+            tag,
+            await waitForEventIdempotencyClaim(idempotencyClaimPath),
+            resolveData
+          );
+        }
+      }
 
       // Step lifecycle events are serialized per-step via an in-process mutex
       // so that the "check state, then write" sequence in step_started /
@@ -203,9 +339,35 @@ export function createEventsStorage(
         const lockKey = tag
           ? `${runId}-${data.correlationId}.${tag}`
           : `${runId}-${data.correlationId}`;
-        return withStepLock(lockKey, () => createImpl());
+        return withStepLock(lockKey, () => createWithIdempotencyCleanup());
       }
-      return createImpl();
+      return createWithIdempotencyCleanup();
+
+      async function createWithIdempotencyCleanup(): Promise<EventResult> {
+        try {
+          const result = await createImpl();
+          if (idempotencyClaimPath && idempotencyClaimed) {
+            if (result.event) {
+              await writeJSON(
+                idempotencyClaimPath,
+                {
+                  runId: result.event.runId,
+                  eventId: result.event.eventId,
+                } satisfies EventIdempotencyClaim,
+                { overwrite: true }
+              );
+            } else {
+              await fs.unlink(idempotencyClaimPath).catch(() => {});
+            }
+          }
+          return result;
+        } catch (error) {
+          if (idempotencyClaimPath && idempotencyClaimed) {
+            await fs.unlink(idempotencyClaimPath).catch(() => {});
+          }
+          throw error;
+        }
+      }
 
       async function createImpl(): Promise<EventResult> {
         const eventId = `evnt_${monotonicUlid()}`;
@@ -1145,7 +1307,6 @@ export function createEventsStorage(
           taggedPath(basedir, 'events', compositeKey, tag),
           event
         );
-
         const resolveData = params?.resolveData ?? DEFAULT_RESOLVE_DATA_OPTION;
         const filteredEvent = stripEventDataRefs(event, resolveData);
 

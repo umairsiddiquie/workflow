@@ -6,3 +6,4 @@ Integrates with Vercel's infrastructure for storage, queuing, and authentication
 
 Used by default for deployments on Vercel. Authentication and API endpoints are configured automatically in Vercel deployments.
 
+Event creation forwards idempotency keys to Vercel storage so retried event writes can be deduplicated by the platform.
